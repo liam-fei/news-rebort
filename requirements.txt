@@ -1,8 +1,8 @@
 feedparser
-google-genai
+requests
 edge-tts
 python-telegram-bot
 schedule
 flask
-requests
 aiofiles
+pydub
