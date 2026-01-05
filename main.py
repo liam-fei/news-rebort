@@ -1,6 +1,6 @@
 # =============================================
-# Fredly News Bot - The "Unbreakable" Edition
-# HTTP Request + Gemini 1.5 Flash (最稳免费版)
+# Fredly News Bot - Smart Discovery Edition
+# 智能探测模型 (优先 2.0/2.5 -> 后备 1.5)
 # =============================================
 
 import os
@@ -26,13 +26,8 @@ if not all([GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, CHAT_ID]):
     print("Error: Missing Environment Variables")
     sys.exit(1)
 
-# ✅ 核心修复：使用 gemini-1.5-flash
-# 这是目前 Google 免费层级最慷慨、最稳定的模型
-GEMINI_MODEL = "gemini-1.5-flash"
-
-# ✅ 核心修复：直接硬编码 URL，不通过 SDK
-# 使用 v1beta 接口，因为 Flash 模型在这里最全
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+# 使用 v1beta 接口以获取最新的实验模型列表
+BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 VOICE_NAME = "en-US-AvaNeural"
 TARGET_MINUTES = 15
@@ -40,14 +35,82 @@ ARTICLES_LIMIT = 3
 
 RSS_FEEDS = {
     "Global News": ["http://feeds.bbci.co.uk/news/rss.xml", "http://rss.cnn.com/rss/edition.rss"],
-    "Business": ["https://feeds.bloomberg.com/markets/news.rss", "https://www.cnbc.com/id/100003114/device/rss/rss.html"],
-    "Tech": ["https://techcrunch.com/feed/", "https://www.wired.com/feed/rss"],
-    "Entertainment": ["https://variety.com/feed/"],
+    "Business": ["https://feeds.bloomberg.com/markets/news.rss"],
+    "Tech": ["https://techcrunch.com/feed/"],
     "Sports": ["https://www.espn.com/espn/rss/news"]
 }
 
 OUTPUT_DIR = Path("./outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+# ---------------- SMART MODEL FINDER ----------------
+
+def get_working_api_url():
+    """
+    自动向 Google 询问可用模型，并返回可用的生成 URL。
+    """
+    print("🔍 Auto-detecting available models...")
+    try:
+        # 1. 获取模型列表
+        list_url = f"{BASE_URL}/models?key={GEMINI_API_KEY}"
+        resp = requests.get(list_url, timeout=10)
+        
+        if resp.status_code != 200:
+            print(f"❌ Failed to get models list: {resp.text}")
+            return None
+
+        data = resp.json()
+        if 'models' not in data:
+            print(f"❌ API Key valid but no models found. (Check Google AI Studio)")
+            return None
+
+        # 2. 筛选出支持文本生成的模型
+        candidates = []
+        print("📋 Available Models for your Key:")
+        for m in data['models']:
+            if 'generateContent' in m.get('supportedGenerationMethods', []):
+                model_name = m['name']
+                candidates.append(model_name)
+                # 打印出来方便调试
+                print(f"   -> {model_name}")
+
+        if not candidates:
+            print("❌ No text generation models available.")
+            return None
+
+        # 3. 智能选择：优先 2.x Flash/Pro -> 1.5 Flash -> 其他
+        # 注意：Google 返回的 name 通常包含 'models/' 前缀
+        priority_patterns = [
+            'gemini-2.5',       # 未来版本
+            'gemini-2.0-flash', # 极速版
+            'gemini-2.0-pro',   # 强力版
+            'gemini-1.5-flash', # 最稳后备
+            'gemini-1.5-pro',   # 强力后备
+        ]
+        
+        chosen_model = None
+        for pattern in priority_patterns:
+            # 在候选列表中寻找包含该 pattern 的模型
+            match = next((m for m in candidates if pattern in m), None)
+            if match:
+                chosen_model = match
+                print(f"⚡ Match found for priority '{pattern}': {chosen_model}")
+                break
+        
+        if not chosen_model:
+            chosen_model = candidates[0]  # 兜底用第一个
+            print(f"⚠️ No priority match, using fallback: {chosen_model}")
+        
+        print(f"✅ Selected working model: {chosen_model}")
+        
+        # 4. 构造最终 URL
+        # chosen_model 已经包含 'models/' 前缀，直接拼接
+        generate_url = f"{BASE_URL}/{chosen_model}:generateContent?key={GEMINI_API_KEY}"
+        return generate_url
+
+    except Exception as e:
+        print(f"❌ Discovery failed: {e}")
+        return None
 
 # ---------------- CORE LOGIC ----------------
 
@@ -73,7 +136,13 @@ def fetch_rss_news():
     return articles
 
 def generate_script_via_http(articles):
-    print(f"🤖 Generating Script via HTTP ({GEMINI_MODEL})...")
+    # 动态获取 URL
+    api_url = get_working_api_url()
+    if not api_url:
+        print("❌ Could not find a valid model URL. Aborting.")
+        return None
+
+    print(f"🤖 Generating Script...")
     
     prompt_text = (
         f"You are Sara, a warm news anchor. Create a {TARGET_MINUTES}-minute news script. "
@@ -82,7 +151,6 @@ def generate_script_via_http(articles):
     for art in articles:
         prompt_text += f"[{art['category']}] {art['title']}: {art['summary']}\n---\n"
 
-    # 构建标准的 Google API Payload
     payload = {
         "contents": [{
             "parts": [{"text": prompt_text}]
@@ -90,9 +158,8 @@ def generate_script_via_http(articles):
     }
 
     try:
-        # 直接发送 POST 请求，绕过所有 SDK 版本问题
         response = requests.post(
-            GEMINI_URL, 
+            api_url, 
             headers={'Content-Type': 'application/json'},
             data=json.dumps(payload),
             timeout=60
@@ -106,13 +173,12 @@ def generate_script_via_http(articles):
                     print("✅ Script Generated Successfully")
                     return script
                 else:
-                    print(f"❌ Safety Block or Empty: {result}")
+                    print(f"❌ Empty Response (Safety/Quota?): {result}")
                     return None
             except (KeyError, IndexError):
-                print(f"❌ Parse Error: {result}")
+                print(f"❌ Json Parse Error: {result}")
                 return None
         else:
-            # 打印详细错误，方便调试
             print(f"❌ API Error: {response.status_code} - {response.text}")
             return None
 
@@ -159,7 +225,7 @@ if __name__ == "__main__":
     from keep_alive import keep_alive
     keep_alive()
 
-    print(f"🚀 Fredly News Bot (HTTP 1.5 Flash) Ready")
+    print(f"🚀 Fredly News Bot (Smart Discovery) Ready")
     schedule.every().day.at("03:00").do(run_daily_job)
 
     if os.getenv("RUN_NOW", "false").lower() == "true":
