@@ -1,10 +1,9 @@
 # =============================================
-# Fredly Daily News - Gemini + EdgeTTS (Free)
-# Duration: ~15 Minutes
+# Fredly News Bot - Gemini New SDK Version
 # =============================================
 
 import feedparser
-import google.generativeai as genai
+from google import genai  # 使用新版导入
 from telegram.ext import Application
 from telegram.request import HTTPXRequest
 import schedule
@@ -25,7 +24,8 @@ if not all([GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, CHAT_ID]):
     print("❌ 错误: 缺少必要的环境变量")
     sys.exit(1)
 
-genai.configure(api_key=GEMINI_API_KEY)
+# 初始化新版 Gemini 客户端
+client = genai.Client(api_key=GEMINI_API_KEY)
 VOICE_NAME = "en-US-AvaNeural" 
 
 RSS_FEEDS = {
@@ -39,9 +39,8 @@ RSS_FEEDS = {
 OUTPUT_DIR = Path('./outputs')
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# === 修改点在这里 ===
-TARGET_MINUTES = 15  # 改为 15 分钟
-ARTICLES_LIMIT = 3   # 改为每类 3 篇 (总共 15 篇，节奏更稳)
+TARGET_MINUTES = 15
+ARTICLES_LIMIT = 3
 
 t_request = HTTPXRequest(connection_pool_size=8, read_timeout=300.0, write_timeout=300.0, connect_timeout=60.0)
 
@@ -72,28 +71,25 @@ def fetch_latest_articles():
     return all_articles
 
 def generate_script_with_gemini(articles):
-    print("🤖 Gemini 正在撰写新闻稿...")
+    print("🤖 Gemini 正在撰写新闻稿 (New SDK)...")
     
     prompt = f"""
     Role: You are Sara, a professional, warm, and engaging news anchor.
     Date: {datetime.now().strftime('%B %d, %Y')}
-    Task: Create a cohesive {TARGET_MINUTES}-minute daily news podcast script.
-    
-    Instructions:
-    1. **Structure**: Intro -> Politics/Global -> Business -> Tech -> Entertainment -> Sports -> Outro.
-    2. **Style**: Conversational but professional. Use smooth transitions.
-    3. **Content**: Synthesize the provided articles. Don't just list them. Connect the dots.
-    4. **Formatting**: Plain text only. NO markdown.
-    5. **Length**: Approximately 1800-2200 words.  <-- Adjusted for 15 mins
+    Task: Create a {TARGET_MINUTES}-minute news script. Plain text only. NO markdown.
+    Approximately 2000 words.
 
-    Source Articles:
+    Articles:
     """
     for art in articles:
-        prompt += f"\nSection: {art['category']}\nHeadline: {art['title']}\nSummary: {art['summary']}\n---"
+        prompt += f"\n[{art['category']}] {art['title']}: {art['summary']}\n---"
 
-    model = genai.GenerativeModel('gemini-1.5-flash')
     try:
-        response = model.generate_content(prompt)
+        # 新版 SDK 调用语法
+        response = client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=prompt
+        )
         return response.text
     except Exception as e:
         print(f"❌ Gemini API Error: {e}")
@@ -103,11 +99,11 @@ async def process_audio_and_send(script_text):
     date_str = datetime.now().strftime('%Y-%m-%d')
     mp3_path = OUTPUT_DIR / f'briefing_{date_str}.mp3'
 
-    print(f"🎙️ 正在合成语音 ({VOICE_NAME})...")
+    print(f"🎙️ 正在合成语音...")
     try:
         communicate = edge_tts.Communicate(script_text, VOICE_NAME)
         await communicate.save(mp3_path)
-        print(f"✅ 音频已保存: {mp3_path}")
+        print(f"✅ 音频已保存")
     except Exception as e:
         print(f"❌ TTS Error: {e}")
         return
@@ -121,17 +117,12 @@ async def process_audio_and_send(script_text):
                 await app.bot.send_audio(
                     chat_id=CHAT_ID, 
                     audio=audio_file, 
-                    caption=f'🎙️ Daily Briefing ({TARGET_MINUTES}min) - {date_str}',
-                    title=f"News {date_str}",
-                    performer="Sara (Gemini AI)"
+                    caption=f'🎙️ Daily Briefing - {date_str}'
                 )
         print("✅ 发送成功！")
-        if os.path.exists(mp3_path):
-            os.remove(mp3_path)
+        if os.path.exists(mp3_path): os.remove(mp3_path)
     except Exception as e:
         print(f"❌ Telegram Error: {e}")
-
-# ---------------- RUNNER ----------------
 
 def job():
     print(f'\n>>> 任务开始: {datetime.now()}')
@@ -140,17 +131,16 @@ def job():
     script = generate_script_with_gemini(articles)
     if not script: return
     asyncio.run(process_audio_and_send(script))
-    print(f'<<< 任务结束: {datetime.now()}\n')
+    print(f'<<< 任务结束\n')
 
 if __name__ == "__main__":
     from keep_alive import keep_alive
     keep_alive()
 
-    print(f"\n🚀 Fredly News Bot (15 min version) 已启动")
-    schedule.every().day.at("03:00").do(job) # UTC 03:00 = Dubai 07:00
+    print(f"\n🚀 News Bot 已启动")
+    schedule.every().day.at("03:00").do(job)
 
     if os.getenv("RUN_NOW", "false").lower() == "true":
-        print("🔥 立即运行一次测试...")
         job()
 
     while True:
