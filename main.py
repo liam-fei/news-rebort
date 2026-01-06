@@ -1,6 +1,6 @@
 # =============================================
-# Fredly News Bot - Low Memory & High Traffic
-# 特性：FFmpeg流式混音 (防崩溃) + 40篇昨日热榜
+# Fredly News Bot - Final Complete Edition
+# 特性：文字简报(Markdown) + 语音播报 + 自动防休眠接口
 # =============================================
 
 import os
@@ -13,11 +13,12 @@ import edge_tts
 import requests
 import json
 import tarfile
-import subprocess  # 引入子进程，用于直接调用 FFmpeg
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from telegram.ext import Application
 from telegram.request import HTTPXRequest
+from telegram.constants import ParseMode # 用于发送 Markdown 格式文字
 
 # ---------------- CONFIG ----------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -31,18 +32,13 @@ if not all([GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, CHAT_ID]):
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 VOICE_CN = "zh-CN-XiaoxiaoNeural"
 VOICE_EN = "en-US-AvaNeural"
-TARGET_MINUTES = 13
+TARGET_MINUTES = 12
 CANDIDATE_POOL_SIZE = 40 
 
-# BGM: Lofi Hip Hop
-BGM_URL = "https://cdn.pixabay.com/download/audio/2022/05/27/audio_1808fbf07a.mp3?filename=lofi-study-112191.mp3"
-
-# Google News 聚合源 (昨日热点)
 RSS_FEEDS = {
     "Global": ["https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en"],
     "Tech": ["https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-US&gl=US&ceid=US:en"],
-    "Business": ["https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en"],
-    "Science": ["https://news.google.com/rss/headlines/section/topic/SCIENCE?hl=en-US&gl=US&ceid=US:en"]
+    "Business": ["https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en"]
 }
 
 OUTPUT_DIR = Path("./outputs")
@@ -83,9 +79,7 @@ def get_api_url():
         cands = [m['name'] for m in r.json().get('models',[]) if 'generateContent' in m.get('supportedGenerationMethods',[])]
         prio = ['gemini-2.5', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash']
         chosen = next((m for p in prio for m in cands if p in m), cands[0] if cands else None)
-        if chosen: 
-            print(f"✅ Model: {chosen}")
-            return f"{BASE_URL}/{chosen}:generateContent?key={GEMINI_API_KEY}"
+        if chosen: return f"{BASE_URL}/{chosen}:generateContent?key={GEMINI_API_KEY}"
     except: pass
     return None
 
@@ -96,145 +90,155 @@ def call_gemini(prompt, url):
     except Exception as e: print(f"Gemini Err: {e}")
     return None
 
-# ---------------- 2. FETCH (High Volume) ----------------
+# ---------------- 2. FETCH & GEN ----------------
 def fetch_rss_news():
-    print("\n📡 Fetching Top Headlines...")
+    print("\n📡 Fetching RSS...")
     articles = []
-    seen_titles = set()
-    
+    seen = set()
     for cat, feeds in RSS_FEEDS.items():
         for url in feeds:
             if len(articles) >= CANDIDATE_POOL_SIZE: break
             try:
                 d = feedparser.parse(url)
-                # 每个源取前 10 条
                 for entry in d.entries[:10]: 
                     title = entry.get("title", "").split(" - ")[0]
-                    if title and title not in seen_titles:
+                    if title and title not in seen:
                         articles.append(f"[{cat}] {title}")
-                        seen_titles.add(title)
+                        seen.add(title)
             except: pass
-            
     print(f"✅ Collected {len(articles)} headlines.")
     return articles
 
-def generate_scripts(articles):
+def generate_content(articles):
     url = get_api_url()
-    if not url: return None, None
-    
+    if not url: return None, None, None
     news_text = "\n".join(articles)
-    yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    today_str = datetime.now().strftime("%Y-%m-%d")
 
-    print("🤖 Selecting Yesterday's Top Stories...")
+    print("🤖 Generating Content...")
 
-    # 中文导语
-    p_cn = (
-        f"Role: News Editor. Context: Today is {datetime.now().strftime('%Y-%m-%d')}. "
-        f"Task: Select Top 5 stories from YESTERDAY ({yesterday_str}). "
-        f"Output: Spoken CHINESE intro. "
-        f"1. Start: '大家早上好，今天是[Date]。回顾昨天全球大事...'\n"
-        f"2. Summarize top stories.\n"
-        f"3. End: '接下来请听 Sara 的深度英文分析。'\n"
+    # [1] 文字简报 (Telegram Markdown)
+    # 专门用于发送文字消息，使用 Emoji 和列表，方便阅读
+    p_text_brief = (
+        f"Role: News Editor. Context: Morning Briefing {today_str}.\n"
+        f"Task: Select the Top 5 most important stories from the list.\n"
+        f"Output: A clean Markdown summary in Chinese.\n"
+        f"Format:\n"
+        f"📅 **早安简报 {today_str}**\n\n"
+        f"🌍 **全球头条**\n- [Story 1 headline]\n- [Story 2 headline]\n\n"
+        f"💻 **科技财经**\n- [Story 3 headline]\n- [Story 4 headline]\n\n"
+        f"👇 *详细深度分析请收听下方音频*\n"
         f"Headlines: {news_text}"
     )
-    cn = call_gemini(p_cn, url)
+    text_brief = call_gemini(p_text_brief, url)
 
-    # 英文正文
-    print("🤖 Writing Deep Dive Analysis...")
-    p_en = (
-        f"Role: Sara, news analyst. Task: {TARGET_MINUTES}-minute 'Daily Recap' script in ENGLISH. "
-        f"Focus: Recap PAST 24 HOURS. "
-        f"Structure: Intro -> The Big Story (4 mins) -> Tech/Markets -> Rapid Recap -> Outro. "
-        f"Tone: Analytical. Length: ~1800 words.\n"
+    # [2] 中文导语 (语音稿) - 央视风
+    p_cn_audio = (
+        f"Role: News Anchor. Context: {today_str}.\n"
+        f"Task: Spoken Chinese Intro. Select top 4 stories.\n"
+        f"Style: CCTV News. Formal. No 'First/Second'.\n"
+        f"Start: '这里是Fredly早间新闻。今天是{today_str}。'\n"
+        f"End: '以下是详细英文报道。'\n"
         f"Headlines: {news_text}"
     )
-    en = call_gemini(p_en, url)
-    return cn, en
+    cn_audio = call_gemini(p_cn_audio, url)
 
-# ---------------- 3. PRODUCTION (Low Memory) ----------------
-async def produce_show(cn_txt, en_txt):
+    # [3] 英文正文 (语音稿) - CNN风
+    p_en_audio = (
+        f"Role: Senior Correspondent.\n"
+        f"Task: {TARGET_MINUTES}-minute deep dive report.\n"
+        f"Style: BBC/CNN. Formal. NO GREETING (Start with story).\n"
+        f"Content: 3 Deep Dives + 5 Briefs.\n"
+        f"Length: ~1600 words.\n"
+        f"Headlines: {news_text}"
+    )
+    en_audio = call_gemini(p_en_audio, url)
+
+    return text_brief, cn_audio, en_audio
+
+# ---------------- 3. PRODUCTION ----------------
+async def produce_audio(cn_txt, en_txt):
     if not ensure_ffmpeg(): return None
-    print("🎙️ Audio Production (Stream Mode)...")
+    print("🎙️ Audio Production...")
     
-    # 路径定义
     f_cn = OUTPUT_DIR / "part1.mp3"
     f_en = OUTPUT_DIR / "part2.mp3"
-    f_bgm = OUTPUT_DIR / "bgm.mp3"
     f_final = OUTPUT_DIR / "final_show.mp3"
     
-    # 1. 生成干音
+    # 干音生成 (正常语速)
     await edge_tts.Communicate(cn_txt, VOICE_CN).save(f_cn)
-    await edge_tts.Communicate(en_txt, VOICE_EN, rate="-5%").save(f_en)
+    await edge_tts.Communicate(en_txt, VOICE_EN).save(f_en)
     
-    # 2. 下载 BGM
-    if not f_bgm.exists():
-        print("   Downloading BGM...")
-        with open(f_bgm, "wb") as f:
-            f.write(requests.get(BGM_URL).content)
-
-    print("🎚️ Mixing via FFmpeg (Memory Safe)...")
-    
-    # 🔥 核心修改：使用 FFmpeg 命令行直接混音，不使用 Pydub 加载到内存
-    # 逻辑：[0]+[1] 拼接语音 -> [2] BGM 循环并降低音量 -> 混合
+    # 混音 & 增益
     cmd = [
-        "ffmpeg", "-y",
-        "-i", str(f_cn),  # 输入0: 中文
-        "-i", str(f_en),  # 输入1: 英文
-        "-stream_loop", "-1", "-i", str(f_bgm), # 输入2: BGM (无限循环)
-        "-filter_complex",
-        # 1. 拼接中文和英文 (n=2:v=0:a=1)，中间稍微停顿一下比较难写，直接硬拼
-        "[0:a][1:a]concat=n=2:v=0:a=1[voice];" 
-        # 2. 处理 BGM: 音量减小 (volume=0.1)
-        "[2:a]volume=0.1[bgm];"
-        # 3. 混合: 语音流和BGM流，duration=first (以语音长度为准)
-        "[voice][bgm]amix=inputs=2:duration=first:dropout_transition=2[out]",
-        "-map", "[out]",
-        str(f_final)
+        "ffmpeg", "-y", "-i", str(f_cn), "-i", str(f_en),
+        "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a];[a]volume=1.3[out]",
+        "-map", "[out]", str(f_final)
     ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    f_cn.unlink(); f_en.unlink()
+    return f_final
 
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print("✅ Mixing Complete!")
-        
-        # 清理临时文件
-        f_cn.unlink()
-        f_en.unlink()
-        return f_final
-    except Exception as e:
-        print(f"❌ FFmpeg Error: {e}")
-        return None
-
-async def send_tg(path):
-    print("📤 Sending...")
+async def send_package(text_brief, audio_path):
+    print("📤 Sending Package...")
     t_req = HTTPXRequest(read_timeout=300, write_timeout=300)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).request(t_req).build()
     d = datetime.now().strftime("%Y-%m-%d")
+    
     async with app:
         await app.initialize()
-        with open(path, "rb") as f:
-            await app.bot.send_audio(
-                CHAT_ID, f, 
-                caption=f"🔥 Yesterday's Top Stories - {d}", 
-                title=f"Daily Recap {d}", performer="Fredly Bot"
-            )
-    path.unlink()
-    print("✅ Sent!")
+        
+        # 1. 发送文字简报
+        if text_brief:
+            # 简单的 markdown 清洗，防止 Gemini 输出不标准的 markdown 导致报错
+            safe_text = text_brief.replace("#", "") 
+            try:
+                await app.bot.send_message(CHAT_ID, text=safe_text, parse_mode=ParseMode.MARKDOWN)
+            except:
+                # 如果 Markdown 报错，尝试发送纯文本
+                await app.bot.send_message(CHAT_ID, text=safe_text)
+
+        # 2. 发送音频
+        if audio_path and audio_path.exists():
+            with open(audio_path, "rb") as f:
+                await app.bot.send_audio(
+                    CHAT_ID, f, 
+                    caption=f"🎧 Daily News - {d}", 
+                    title=f"News {d}", performer="Fredly Bot"
+                )
+            audio_path.unlink()
+            
+    print("✅ All Sent!")
 
 # ---------------- RUN ----------------
 def job():
     print(f"\n>>> Job: {datetime.now()}")
     news = fetch_rss_news()
     if not news: return
-    cn, en = generate_scripts(news)
-    if cn and en:
-        path = asyncio.run(produce_show(cn, en))
-        if path: asyncio.run(send_tg(path))
+    
+    # 生成三个部分：文字稿、中文音源稿、英文音源稿
+    txt, cn_aud, en_aud = generate_content(news)
+    
+    if cn_aud and en_aud:
+        # 制作音频
+        audio_path = asyncio.run(produce_audio(cn_aud, en_aud))
+        # 打包发送
+        asyncio.run(send_package(txt, audio_path))
+        
     print("<<< End")
 
 if __name__ == "__main__":
     from keep_alive import keep_alive
-    keep_alive()
-    print("🚀 Fredly Bot (Low Memory Edition) Ready")
-    schedule.every().day.at("03:00").do(job)
+    keep_alive() # 启动 Web 服务器
+    
+    print("🚀 Fredly Bot (Text+Audio) Ready")
+    
+    # 设定定时任务
+    schedule.every().day.at("03:00").do(job) # UTC 03:00 = Dubai 07:00
+
+    # 调试模式开关
     if os.getenv("RUN_NOW","false").lower()=="true": job()
-    while 1: schedule.run_pending(); time.sleep(60)
+
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
