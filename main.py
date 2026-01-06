@@ -1,6 +1,6 @@
 # =============================================
-# Fredly News Bot - Ultimate Commute Edition
-# 特性：中文导语(中文声) + 英文深度(英文声) + 自动拼接 + BGM
+# Fredly News Bot - Low Memory & High Traffic
+# 特性：FFmpeg流式混音 (防崩溃) + 40篇昨日热榜
 # =============================================
 
 import os
@@ -13,11 +13,11 @@ import edge_tts
 import requests
 import json
 import tarfile
-from datetime import datetime
+import subprocess  # 引入子进程，用于直接调用 FFmpeg
+from datetime import datetime, timedelta
 from pathlib import Path
 from telegram.ext import Application
 from telegram.request import HTTPXRequest
-from pydub import AudioSegment
 
 # ---------------- CONFIG ----------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -28,26 +28,21 @@ if not all([GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, CHAT_ID]):
     print("❌ Error: Missing Environment Variables")
     sys.exit(1)
 
-# API 设置
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-
-# --- 配音员设置 ---
-# 中文导语声优 (知性女声)
 VOICE_CN = "zh-CN-XiaoxiaoNeural"
-# 英文主播声优 (Sara)
 VOICE_EN = "en-US-AvaNeural"
+TARGET_MINUTES = 13
+CANDIDATE_POOL_SIZE = 40 
 
-TARGET_MINUTES = 12 # 设定英文部分约12-13分钟，加上中文刚好15分钟内
-ARTICLES_LIMIT = 4
-
-# BGM: 舒缓的 Lofi (开车听很舒服)
+# BGM: Lofi Hip Hop
 BGM_URL = "https://cdn.pixabay.com/download/audio/2022/05/27/audio_1808fbf07a.mp3?filename=lofi-study-112191.mp3"
 
+# Google News 聚合源 (昨日热点)
 RSS_FEEDS = {
-    "Global": ["http://feeds.bbci.co.uk/news/rss.xml", "http://rss.cnn.com/rss/edition.rss"],
-    "Tech": ["https://techcrunch.com/feed/"],
-    "Business": ["https://feeds.bloomberg.com/markets/news.rss"],
-    "Life": ["https://www.wired.com/feed/rss"]
+    "Global": ["https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en"],
+    "Tech": ["https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-US&gl=US&ceid=US:en"],
+    "Business": ["https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en"],
+    "Science": ["https://news.google.com/rss/headlines/section/topic/SCIENCE?hl=en-US&gl=US&ceid=US:en"]
 }
 
 OUTPUT_DIR = Path("./outputs")
@@ -55,217 +50,191 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 BIN_DIR = Path("./bin")
 BIN_DIR.mkdir(exist_ok=True)
 
-# ---------------- 0. FFmpeg Auto-Setup ----------------
+# ---------------- 0. FFmpeg Setup ----------------
 def ensure_ffmpeg():
-    """自动安装 FFmpeg (混音和拼接必需)"""
     ffmpeg_path = BIN_DIR / "ffmpeg"
     if ffmpeg_path.exists():
         os.environ["PATH"] += os.pathsep + str(BIN_DIR.absolute())
         return True
-
-    print("🛠️ Installing FFmpeg static build...")
+    print("🛠️ Installing FFmpeg...")
     try:
         url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
-        response = requests.get(url, stream=True)
-        tar_path = BIN_DIR / "ffmpeg.tar.xz"
-        with open(tar_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        with tarfile.open(tar_path, "r:xz") as tar:
-            for member in tar.getmembers():
-                if member.name.endswith("/ffmpeg"):
-                    member.name = "ffmpeg"
-                    tar.extract(member, path=BIN_DIR)
+        r = requests.get(url, stream=True)
+        t_path = BIN_DIR / "ff.tar.xz"
+        with open(t_path, "wb") as f:
+            for c in r.iter_content(8192): f.write(c)
+        with tarfile.open(t_path, "r:xz") as tar:
+            for m in tar.getmembers():
+                if m.name.endswith("/ffmpeg"):
+                    m.name = "ffmpeg"
+                    tar.extract(m, path=BIN_DIR)
                     break
-        
-        (BIN_DIR / "ffmpeg").chmod(0o755)
+        (BIN_DIR/"ffmpeg").chmod(0o755)
         os.environ["PATH"] += os.pathsep + str(BIN_DIR.absolute())
-        tar_path.unlink()
-        print("✅ FFmpeg installed!")
+        t_path.unlink()
         return True
-    except Exception as e:
-        print(f"❌ FFmpeg install failed: {e}")
-        return False
+    except: return False
 
-# ---------------- 1. SMART MODEL FINDER ----------------
+# ---------------- 1. API ----------------
 def get_api_url():
-    """获取可用 Gemini URL"""
-    print("🔍 Auto-detecting models...")
     try:
-        resp = requests.get(f"{BASE_URL}/models?key={GEMINI_API_KEY}", timeout=10)
-        if resp.status_code != 200: return None
-        candidates = [m['name'] for m in resp.json().get('models', []) if 'generateContent' in m.get('supportedGenerationMethods', [])]
-        
-        # 优先 2.5/2.0，其次 1.5
-        priority = ['gemini-2.5', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro']
-        chosen = next((m for p in priority for m in candidates if p in m), candidates[0] if candidates else None)
-        
-        if chosen:
+        r = requests.get(f"{BASE_URL}/models?key={GEMINI_API_KEY}", timeout=10)
+        if r.status_code!=200: return None
+        cands = [m['name'] for m in r.json().get('models',[]) if 'generateContent' in m.get('supportedGenerationMethods',[])]
+        prio = ['gemini-2.5', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash']
+        chosen = next((m for p in prio for m in cands if p in m), cands[0] if cands else None)
+        if chosen: 
             print(f"✅ Model: {chosen}")
             return f"{BASE_URL}/{chosen}:generateContent?key={GEMINI_API_KEY}"
     except: pass
     return None
 
-# ---------------- 2. CONTENT GENERATION ----------------
-def call_gemini(prompt, model_url):
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+def call_gemini(prompt, url):
     try:
-        resp = requests.post(model_url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload), timeout=60)
-        if resp.status_code == 200:
-            return resp.json()['candidates'][0]['content']['parts'][0]['text']
-    except Exception as e:
-        print(f"Gemini Error: {e}")
+        r = requests.post(url, headers={'Content-Type':'application/json'}, data=json.dumps({"contents":[{"parts":[{"text":prompt}]}]}), timeout=90)
+        if r.status_code==200: return r.json()['candidates'][0]['content']['parts'][0]['text']
+    except Exception as e: print(f"Gemini Err: {e}")
     return None
 
+# ---------------- 2. FETCH (High Volume) ----------------
 def fetch_rss_news():
-    print("\n📡 Fetching RSS...")
+    print("\n📡 Fetching Top Headlines...")
     articles = []
     seen_titles = set()
+    
     for cat, feeds in RSS_FEEDS.items():
         for url in feeds:
-            if len(articles) >= 12: break
+            if len(articles) >= CANDIDATE_POOL_SIZE: break
             try:
                 d = feedparser.parse(url)
-                for entry in d.entries[:1]:
-                    title = entry.get("title", "")
-                    if title not in seen_titles:
-                        articles.append(f"[{cat}] {title}: {entry.get('summary', '')[:300]}")
+                # 每个源取前 10 条
+                for entry in d.entries[:10]: 
+                    title = entry.get("title", "").split(" - ")[0]
+                    if title and title not in seen_titles:
+                        articles.append(f"[{cat}] {title}")
                         seen_titles.add(title)
             except: pass
-    print(f"✅ Got {len(articles)} articles")
+            
+    print(f"✅ Collected {len(articles)} headlines.")
     return articles
 
 def generate_scripts(articles):
     url = get_api_url()
     if not url: return None, None
-    articles_text = "\n".join(articles)
+    
+    news_text = "\n".join(articles)
+    yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # --- Part 1: 中文导语 ---
-    print("🤖 Generating Chinese Intro...")
-    intro_prompt = (
-        f"You are a news assistant. Create a spoken introduction in CHINESE based on these articles.\n"
-        f"Format requirements:\n"
-        f"1. Start with '大家早上好，今天是[Date]。'\n"
-        f"2. Summarize the top 3-4 most important headlines in one sentence each (e.g. '今天的重点新闻有：XXX，以及XXX...').\n"
-        f"3. End with exactly: '接下来请听 Sara 为您带来的详细英文报道。'\n"
-        f"Keep it under 1 minute. Natural spoken Chinese.\n\n"
-        f"Articles: {articles_text}"
+    print("🤖 Selecting Yesterday's Top Stories...")
+
+    # 中文导语
+    p_cn = (
+        f"Role: News Editor. Context: Today is {datetime.now().strftime('%Y-%m-%d')}. "
+        f"Task: Select Top 5 stories from YESTERDAY ({yesterday_str}). "
+        f"Output: Spoken CHINESE intro. "
+        f"1. Start: '大家早上好，今天是[Date]。回顾昨天全球大事...'\n"
+        f"2. Summarize top stories.\n"
+        f"3. End: '接下来请听 Sara 的深度英文分析。'\n"
+        f"Headlines: {news_text}"
     )
-    cn_script = call_gemini(intro_prompt, url)
+    cn = call_gemini(p_cn, url)
 
-    # --- Part 2: 英文正文 ---
-    print("🤖 Generating English Deep Dive...")
-    main_prompt = (
-        f"Role: Sara, a news anchor. \n"
-        f"Task: Create a {TARGET_MINUTES}-minute news script in ENGLISH.\n"
-        f"Start immediately with 'Hello, I'm Sara. Let's dive into the stories.' (Do not repeat the date).\n"
-        f"Cover the provided articles in depth. Use transitions. Be engaging.\n"
-        f"Total word count aim: ~1600 words.\n"
-        f"Plain text only.\n\n"
-        f"Articles: {articles_text}"
+    # 英文正文
+    print("🤖 Writing Deep Dive Analysis...")
+    p_en = (
+        f"Role: Sara, news analyst. Task: {TARGET_MINUTES}-minute 'Daily Recap' script in ENGLISH. "
+        f"Focus: Recap PAST 24 HOURS. "
+        f"Structure: Intro -> The Big Story (4 mins) -> Tech/Markets -> Rapid Recap -> Outro. "
+        f"Tone: Analytical. Length: ~1800 words.\n"
+        f"Headlines: {news_text}"
     )
-    en_script = call_gemini(main_prompt, url)
+    en = call_gemini(p_en, url)
+    return cn, en
 
-    return cn_script, en_script
-
-# ---------------- 3. AUDIO PRODUCTION ----------------
-
-async def produce_radio_show(cn_text, en_text):
+# ---------------- 3. PRODUCTION (Low Memory) ----------------
+async def produce_show(cn_txt, en_txt):
     if not ensure_ffmpeg(): return None
-
-    print("🎙️ Production Start...")
+    print("🎙️ Audio Production (Stream Mode)...")
     
-    # 1. 生成中文导语 (Xiaoxiao)
-    path_cn = OUTPUT_DIR / "intro_cn.mp3"
-    await edge_tts.Communicate(cn_text, VOICE_CN).save(path_cn)
+    # 路径定义
+    f_cn = OUTPUT_DIR / "part1.mp3"
+    f_en = OUTPUT_DIR / "part2.mp3"
+    f_bgm = OUTPUT_DIR / "bgm.mp3"
+    f_final = OUTPUT_DIR / "final_show.mp3"
     
-    # 2. 生成英文正文 (Sara/Ava) - 语速 -5% 适合通勤
-    path_en = OUTPUT_DIR / "main_en.mp3"
-    await edge_tts.Communicate(en_text, VOICE_EN, rate="-5%").save(path_en)
-
-    # 3. 拼接音频
-    print("🎚️ Splicing Audio...")
-    seg_cn = AudioSegment.from_file(path_cn)
-    seg_en = AudioSegment.from_file(path_en)
-    # 中间加 1 秒空白停顿
-    silence = AudioSegment.silent(duration=1000) 
-    combined_voice = seg_cn + silence + seg_en
-
-    # 4. 混入 BGM
-    print("🎵 Mixing BGM...")
-    bgm_path = OUTPUT_DIR / "bgm.mp3"
-    if not bgm_path.exists():
-        r = requests.get(BGM_URL)
-        with open(bgm_path, "wb") as f: f.write(r.content)
+    # 1. 生成干音
+    await edge_tts.Communicate(cn_txt, VOICE_CN).save(f_cn)
+    await edge_tts.Communicate(en_txt, VOICE_EN, rate="-5%").save(f_en)
     
-    bgm = AudioSegment.from_file(bgm_path)
-    # BGM 音量降低 19dB (确保人声清晰)
-    bgm = bgm - 19
-    
-    # 循环 BGM 直到覆盖全长
-    target_len = len(combined_voice) + 4000
-    while len(bgm) < target_len:
-        bgm += bgm
-    bgm = bgm[:target_len]
-    bgm = bgm.fade_in(2000).fade_out(3000)
+    # 2. 下载 BGM
+    if not f_bgm.exists():
+        print("   Downloading BGM...")
+        with open(f_bgm, "wb") as f:
+            f.write(requests.get(BGM_URL).content)
 
-    # 混合: BGM 在人声开始前 0.5秒淡入
-    final_mix = bgm.overlay(combined_voice, position=500)
-
-    # 导出
-    final_path = OUTPUT_DIR / "daily_show.mp3"
-    final_mix.export(final_path, format="mp3")
+    print("🎚️ Mixing via FFmpeg (Memory Safe)...")
     
-    # 清理中间文件
-    path_cn.unlink()
-    path_en.unlink()
-    
-    return final_path
+    # 🔥 核心修改：使用 FFmpeg 命令行直接混音，不使用 Pydub 加载到内存
+    # 逻辑：[0]+[1] 拼接语音 -> [2] BGM 循环并降低音量 -> 混合
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(f_cn),  # 输入0: 中文
+        "-i", str(f_en),  # 输入1: 英文
+        "-stream_loop", "-1", "-i", str(f_bgm), # 输入2: BGM (无限循环)
+        "-filter_complex",
+        # 1. 拼接中文和英文 (n=2:v=0:a=1)，中间稍微停顿一下比较难写，直接硬拼
+        "[0:a][1:a]concat=n=2:v=0:a=1[voice];" 
+        # 2. 处理 BGM: 音量减小 (volume=0.1)
+        "[2:a]volume=0.1[bgm];"
+        # 3. 混合: 语音流和BGM流，duration=first (以语音长度为准)
+        "[voice][bgm]amix=inputs=2:duration=first:dropout_transition=2[out]",
+        "-map", "[out]",
+        str(f_final)
+    ]
 
-async def upload_telegram(mp3_path):
-    print("📤 Uploading to Telegram...")
-    t_req = HTTPXRequest(read_timeout=300.0, write_timeout=300.0)
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("✅ Mixing Complete!")
+        
+        # 清理临时文件
+        f_cn.unlink()
+        f_en.unlink()
+        return f_final
+    except Exception as e:
+        print(f"❌ FFmpeg Error: {e}")
+        return None
+
+async def send_tg(path):
+    print("📤 Sending...")
+    t_req = HTTPXRequest(read_timeout=300, write_timeout=300)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).request(t_req).build()
-    
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    d = datetime.now().strftime("%Y-%m-%d")
     async with app:
         await app.initialize()
-        with open(mp3_path, "rb") as f:
+        with open(path, "rb") as f:
             await app.bot.send_audio(
-                chat_id=CHAT_ID, 
-                audio=f, 
-                caption=f"🚗 Morning News Drive - {date_str}",
-                title=f"Daily Briefing {date_str}",
-                performer="Fredly Bot"
+                CHAT_ID, f, 
+                caption=f"🔥 Yesterday's Top Stories - {d}", 
+                title=f"Daily Recap {d}", performer="Fredly Bot"
             )
-    print("✅ Done!")
-    mp3_path.unlink()
+    path.unlink()
+    print("✅ Sent!")
 
-# ---------------- JOB ----------------
-def run_job():
-    print(f"\n>>> Job Started: {datetime.now()}")
+# ---------------- RUN ----------------
+def job():
+    print(f"\n>>> Job: {datetime.now()}")
     news = fetch_rss_news()
     if not news: return
-    
     cn, en = generate_scripts(news)
-    if not cn or not en: return
-    
-    final_mp3 = asyncio.run(produce_radio_show(cn, en))
-    if final_mp3:
-        asyncio.run(upload_telegram(final_mp3))
-    print("<<< Job Finished\n")
+    if cn and en:
+        path = asyncio.run(produce_show(cn, en))
+        if path: asyncio.run(send_tg(path))
+    print("<<< End")
 
 if __name__ == "__main__":
     from keep_alive import keep_alive
     keep_alive()
-
-    print(f"🚀 Fredly News Bot (Ultimate Edition) Ready")
-    schedule.every().day.at("03:00").do(run_job)
-
-    if os.getenv("RUN_NOW", "false").lower() == "true":
-        run_job()
-
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+    print("🚀 Fredly Bot (Low Memory Edition) Ready")
+    schedule.every().day.at("03:00").do(job)
+    if os.getenv("RUN_NOW","false").lower()=="true": job()
+    while 1: schedule.run_pending(); time.sleep(60)
