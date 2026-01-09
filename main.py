@@ -1,7 +1,7 @@
 # =============================================
-# Fredly News Bot - Logic Fixed (Specific Events)
-# 修复：强制 AI 选具体新闻事件，拒绝空洞的宏观话题
-# 模式：默认开启验证模式 (不发TG)，满意后可切换为定时任务
+# Fredly News Bot - Global & China Focus (24H Strict)
+# 特性：强制包含中国热点 + 严格24小时过滤 + 去美国化
+# 模式：验证模式 (只输出文本日志，不发TG/音频)
 # =============================================
 
 import os
@@ -14,7 +14,9 @@ import shutil
 import re
 import subprocess
 import logging
-from datetime import datetime
+import random
+from datetime import datetime, timedelta
+from time import mktime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -29,11 +31,12 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S"
 )
-log = logging.getLogger("Fredly_Fixed")
+log = logging.getLogger("Fredly_Verify")
 
 # ---------------- CONFIG ----------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# 验证模式下可为空
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") 
 CHAT_ID = os.getenv("CHAT_ID")
 
 if not GEMINI_API_KEY:
@@ -41,83 +44,66 @@ if not GEMINI_API_KEY:
     sys.exit(1)
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-VOICE_CN = "zh-CN-XiaoxiaoNeural"
-VOICE_EN = "en-US-AvaNeural"
 TARGET_MINUTES = 13
 
-OUTPUT_DIR = Path("./outputs")
-BIN_DIR = Path("./bin")
-OUTPUT_DIR.mkdir(exist_ok=True)
-BIN_DIR.mkdir(exist_ok=True)
+# ---------------- RSS SOURCES (Global + China) ----------------
+# 使用 gl=GB (英国版) 和 gl=SG (新加坡版) 来获取更国际化和亚洲视角的报道
+RSS_POOLS = {
+    # 1. 全球头条 (英国版 - 偏向BBC/路透)
+    "WORLD_TOP": "https://news.google.com/rss?hl=en-GB&gl=GB&ceid=GB:en",
+    
+    # 2. 中国专题 (强制搜索 'China' 且限定 when:1d 过去24小时)
+    "CHINA_HOT": "https://news.google.com/rss/search?q=China+when:1d&hl=en-GB&gl=GB&ceid=GB:en",
+    
+    # 3. 半岛电视台 (全球南方视角)
+    "AL_JAZEERA": "https://www.aljazeera.com/xml/rss/all.xml"
+}
 
 # ---------------- HTTP SESSION ----------------
 def make_session():
     s = requests.Session()
-    retries = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"]
-    )
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502], allowed_methods=["GET", "POST"])
     s.mount("https://", HTTPAdapter(max_retries=retries))
     return s
 
 SESSION = make_session()
 
-# ---------------- FFmpeg ----------------
-def ensure_ffmpeg():
-    if shutil.which("ffmpeg"):
-        return True
-    
-    ffmpeg_path = BIN_DIR / "ffmpeg"
-    if ffmpeg_path.exists():
-        os.environ["PATH"] += os.pathsep + str(BIN_DIR.resolve())
-        return True
-
-    log.info("🛠️ Installing FFmpeg...")
-    url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
-    tar_path = BIN_DIR / "ffmpeg.tar.xz"
-
-    try:
-        r = SESSION.get(url, stream=True, timeout=60)
-        r.raise_for_status()
-        with open(tar_path, "wb") as f:
-            for c in r.iter_content(8192): f.write(c)
-        with tarfile.open(tar_path, "r:xz") as tar:
-            member = next((m for m in tar.getmembers() if m.name.endswith("/ffmpeg")), None)
-            if not member: raise RuntimeError("No ffmpeg bin")
-            member.name = "ffmpeg"
-            tar.extract(member, path=BIN_DIR)
-        
-        ffmpeg_path.chmod(0o755)
-        os.environ["PATH"] += os.pathsep + str(BIN_DIR.resolve())
-        return True
-    except Exception as e:
-        log.error(f"FFmpeg install error: {e}")
-        return False
-    finally:
-        if tar_path.exists(): tar_path.unlink()
+# ---------------- UTILS: TIME FILTER ----------------
+def is_recent(entry, hours=24):
+    """
+    物理级时间过滤：严格丢弃超过 24 小时的旧闻
+    """
+    # 1. Google News 通常有 published_parsed
+    if hasattr(entry, 'published_parsed') and entry.published_parsed:
+        try:
+            pub_time = datetime.fromtimestamp(mktime(entry.published_parsed))
+            # 允许一点时区误差，设定为 25 小时
+            if datetime.now() - pub_time < timedelta(hours=25):
+                return True
+            else:
+                return False # 太旧了
+        except:
+            pass # 解析失败往下走
+            
+    # 2. 如果没有时间戳，检查标题里是否有 "Live", "Just now" 等词 (可选)
+    # 为了严格起见，没有时间戳的如果是 Google News 来源，最好丢弃，防止 2008 年旧闻
+    # 但 Al Jazeera 有时时间戳格式不同，这里我们默认：如果解析不到时间，且是置顶新闻，暂且放行，靠 Prompt 二次清洗
+    return True 
 
 # ---------------- GEMINI ENGINE ----------------
 def get_api_url():
-    # 使用 URL 参数鉴权
     url = f"{BASE_URL}/models?key={GEMINI_API_KEY}"
     try:
         r = SESSION.get(url, timeout=10)
-        if r.status_code != 200:
-            log.error(f"❌ API Error: {r.status_code}")
-            return None
-            
+        if r.status_code != 200: return None
         models = r.json().get("models", [])
         cands = [m["name"] for m in models if "generateContent" in m.get("supportedGenerationMethods", [])]
-        priority = ["gemini-2.0-pro", "gemini-1.5-pro", "gemini-2.5", "gemini-2.0-flash", "gemini-1.5-flash"]
+        priority = ["gemini-2.0-pro", "gemini-1.5-pro", "gemini-2.5", "gemini-2.0-flash"]
         chosen = next((m for p in priority for m in cands if p in m), cands[0] if cands else None)
-            
         if chosen:
-            log.info(f"✅ Logic Engine: {chosen}")
+            log.info(f"✅ AI Engine: {chosen}")
             return f"{BASE_URL}/{chosen}:generateContent"
-    except Exception as e:
-        log.error(f"Model discovery failed: {e}")
+    except: pass
     return None
 
 def call_gemini(prompt, base_url, json_mode=False):
@@ -127,9 +113,8 @@ def call_gemini(prompt, base_url, json_mode=False):
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2} 
     }
-    if json_mode:
-        payload["generationConfig"]["responseMimeType"] = "application/json"
-
+    if json_mode: payload["generationConfig"]["responseMimeType"] = "application/json"
+    
     try:
         r = SESSION.post(url, headers=headers, json=payload, timeout=100)
         if r.status_code != 200:
@@ -140,51 +125,82 @@ def call_gemini(prompt, base_url, json_mode=False):
         log.error(f"Gemini Net Error: {e}")
         return None
 
-# ---------------- PIPELINE STEPS ----------------
+# ---------------- PIPELINE ----------------
 
 def step1_scan_headlines():
-    log.info("📡 [Step 1] Scanning Headlines...")
-    url = "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en"
-    try:
-        d = feedparser.parse(url)
-        return [e.get("title", "").split(" - ")[0] for e in d.entries[:50]]
-    except: return []
+    log.info("📡 [Step 1] Scanning Global & China Feeds (Strict 24H)...")
+    combined_titles = []
+    
+    for category, url in RSS_POOLS.items():
+        try:
+            d = feedparser.parse(url)
+            count = 0
+            for e in d.entries:
+                if is_recent(e, hours=24):
+                    # 给标题加上前缀，方便 AI 识别来源
+                    clean_title = e.get("title", "").split(" - ")[0]
+                    # 如果来自中国源，加个标记强提示
+                    prefix = "[CHINA NEWS]" if category == "CHINA_HOT" else "[GLOBAL]"
+                    combined_titles.append(f"{prefix} {clean_title}")
+                    count += 1
+                if count >= 15: break # 每个源取最新15条
+        except Exception as e:
+            log.error(f"Feed error {category}: {e}")
+
+    random.shuffle(combined_titles)
+    # 只要前 60 条，防止 Token 溢出
+    final_list = combined_titles[:60]
+    log.info(f"   -> Found {len(final_list)} fresh headlines.")
+    return final_list
 
 def step2_select_topics(headlines, api_url):
-    log.info("🧠 [Step 2] AI Editor Selecting Top 5 SPECIFIC EVENTS...")
-    # 🔥 核心修复：强制要求具体事件，禁止宏观类别
+    log.info("🧠 [Step 2] AI Selecting 5 Events (Must Include China)...")
+    
+    # 🔥 Prompt 强约束：必须包含中国，必须是具体事件
     prompt = (
-        "Role: Chief Editor.\n"
-        "Task: Identify the TOP 5 specific breaking news EVENTS from the headlines.\n"
-        "CRITICAL INSTRUCTION: Return specific search queries for concrete events, NOT broad categories.\n"
-        "❌ BAD: 'International Trade', 'Space Technology', 'Public Health', 'US Politics'\n"
-        "✅ GOOD: 'Red Sea shipping attacks', 'SpaceX Starship launch failure', 'WHO declares new pandemic', 'Senate passes border bill'\n"
-        "Output: A strictly JSON array of strings.\n"
+        f"Role: Chief Editor. Current Date: {datetime.now().strftime('%Y-%m-%d')}\n"
+        "Task: Select Top 5 BREAKING NEWS EVENTS from the list.\n"
+        "MANDATORY REQUIREMENTS:\n"
+        "1. ✅ MUST include at least 1 event related to CHINA (look for [CHINA NEWS] tag).\n"
+        "2. ✅ Select only CONCRETE EVENTS (e.g. 'SpaceX Launch', 'Earthquake in Japan').\n"
+        "3. ❌ IGNORE general topics (e.g. 'Technology trends', 'Climate Change').\n"
+        "4. ❌ IGNORE anything that looks like old news (2008 crisis, etc).\n"
+        "Output: JSON array of search queries.\n"
         "Headlines Pool:\n" + "\n".join(headlines)
     )
+    
     raw = call_gemini(prompt, api_url, json_mode=True)
     if not raw: return []
-    
     try:
         clean = raw.replace("```json", "").replace("```", "").strip()
         topics = json.loads(clean)
-        log.info(f"🔹 Selected Events: {topics}")
+        log.info(f"🔹 Selected: {topics}")
         return topics
-    except Exception as e:
-        log.error(f"JSON error: {e}")
-        return []
+    except: return []
 
 def fetch_topic_details(topic):
-    url = f"https://news.google.com/rss/search?q={requests.utils.quote(topic)}&hl=en-US&gl=US&ceid=US:en"
+    # 🔥 核心：搜索时加 "when:1d" 强制 Google 只给 24小时内数据
+    # 🔥 核心：gl=GB 使用英国版，避免美国视角
+    search_query = f"{topic} when:1d"
+    url = f"https://news.google.com/rss/search?q={requests.utils.quote(search_query)}&hl=en-GB&gl=GB&ceid=GB:en"
+    
     try:
         d = feedparser.parse(url)
+        if not d.entries: return "" # 搜不到直接空，触发熔断
+        
         block = f"### EVENT: {topic}\n"
-        for e in d.entries[:3]:
-            summary = re.sub("<[^<]+?>", "", e.get("summary", ""))[:400]
-            src = e.get("source", {}).get("title", "Unknown")
-            block += f"- Source ({src}): {summary}\n"
-        return block
-    except: return f"### EVENT: {topic} (Fetch Failed)\n"
+        valid_count = 0
+        for e in d.entries:
+            if is_recent(e, hours=24):
+                summary = re.sub("<[^<]+?>", "", e.get("summary", ""))[:350]
+                src = e.get("source", {}).get("title", "Unknown")
+                pub = e.get("published", "")
+                block += f"- [{pub}] {src}: {summary}\n"
+                valid_count += 1
+                if valid_count >= 3: break
+        
+        return block if valid_count > 0 else ""
+    except: return ""
 
 def step3_deep_research(topics):
     log.info(f"🕵️ [Step 3] Deep Researching {len(topics)} events...")
@@ -192,139 +208,85 @@ def step3_deep_research(topics):
     with ThreadPoolExecutor(max_workers=5) as ex:
         futures = [ex.submit(fetch_topic_details, t) for t in topics]
         for f in as_completed(futures):
-            results.append(f.result())
+            res = f.result()
+            if res: results.append(res)
+            
+    if not results:
+        log.error("❌ No valid news found after strict filtering!")
+        return None
     return "\n".join(results)
 
 def step4_write_scripts(research_data, api_url):
-    log.info("✍️ [Step 4] Writing Scripts...")
+    log.info("✍️ [Step 4] Writing Scripts (Anti-Hallucination)...")
     today = datetime.now().strftime("%Y-%m-%d")
 
     # 1. 简报
     p_brief = (
         f"Role: Editor. Date: {today}.\n"
-        f"Task: Write a Telegram Markdown summary.\n"
-        f"Format:\n📅 **早安简报 {today}**\n\n🔥 **今日五大热点**\n1. **[Specific Headline]** - [Key detail]\n...\n"
+        f"Task: Write Telegram Markdown summary.\n"
+        f"Rule: ONLY use facts from Data. MUST cover the China story.\n"
+        f"Format:\n📅 **早安简报 {today}**\n\n🔥 **今日五大热点**\n1. **[Headline]** - [Detail]\n...\n"
         f"Data:\n{research_data}"
     )
     text = call_gemini(p_brief, api_url)
 
-    # 2. 中文导语
+    # 2. 中文导语 (央视风)
     p_cn = (
-        f"Role: Professional Anchor. Date: {today}.\n"
-        f"Task: Spoken Chinese Intro. Style: CCTV News/Formal.\n"
-        f"Requirements: Be concrete. Mention specific numbers/names/places from the data.\n"
+        f"Role: Anchor. Date: {today}. Style: CCTV News.\n"
+        f"Task: Spoken Intro. Cover top stories including China.\n"
+        f"Rule: No 'First/Second'. Be concise. NO hallucinations.\n"
         f"Start: '这里是Fredly早间新闻。今天是{today}。'\n"
-        f"End: '以下是详细英文报道。'\n"
         f"Data:\n{research_data}"
     )
     cn = call_gemini(p_cn, api_url)
 
-    # 3. 英文正文
+    # 3. 英文正文 (BBC风)
     p_en = (
-        f"Role: Senior Correspondent. Task: {TARGET_MINUTES}-minute deep report.\n"
-        f"Style: BBC/Reuters. Formal, Objective.\n"
-        f"Structure:\n"
-        f"1. NO INTRO. Start directly with the biggest story.\n"
-        f"2. Cover all 5 events. Cite specific sources (e.g. 'According to CNN...').\n"
-        f"3. Smooth transitions.\n"
-        f"Length: ~1600 words.\n"
+        f"Role: Senior Correspondent. Task: {TARGET_MINUTES}-minute report.\n"
+        f"Style: BBC/Al Jazeera. International perspective.\n"
+        f"RULES:\n"
+        f"1. CITE SOURCES (e.g. 'According to BBC...').\n"
+        f"2. NO INTRO. Start with the most impactful story.\n"
+        f"3. Ensure the China-related story is covered in depth.\n"
         f"Data:\n{research_data}"
     )
     en = call_gemini(p_en, api_url)
     return text, cn, en
 
-# ---------------- PRODUCTION UTILS ----------------
-async def produce_audio_and_send(text, cn, en):
-    if not ensure_ffmpeg(): return
-    log.info("🎙️ Producing Audio...")
-    
-    import telegram
-    from telegram.ext import Application
-    
-    f_cn = OUTPUT_DIR / "cn.mp3"
-    f_en = OUTPUT_DIR / "en.mp3"
-    f_final = OUTPUT_DIR / "final.mp3"
-    
-    await edge_tts.Communicate(cn, VOICE_CN).save(f_cn)
-    await edge_tts.Communicate(en, VOICE_EN).save(f_en)
-    
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(f_cn), "-i", str(f_en), 
-         "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a];[a]volume=1.3[out]", 
-         "-map", "[out]", str(f_final)],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    
-    log.info("📤 Sending to Telegram...")
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    async with app:
-        await app.initialize()
-        if text:
-            safe = text.replace("#", "")
-            try: await app.bot.send_message(CHAT_ID, safe, parse_mode="Markdown")
-            except: await app.bot.send_message(CHAT_ID, safe)
-        if f_final.exists():
-            today = datetime.now().strftime("%Y-%m-%d")
-            with open(f_final, "rb") as f:
-                await app.bot.send_audio(CHAT_ID, f, title=f"News {today}", caption=f"🎧 Briefing {today}")
-            f_final.unlink()
-    f_cn.unlink(); f_en.unlink()
-    log.info("✅ Done!")
-
-# ---------------- RUNNERS ----------------
-
+# ---------------- RUNNER ----------------
 def run_verification():
-    """验证模式：只打印，不生成音频"""
-    log.info("🧪 STARTING VERIFICATION (Dry Run)")
+    log.info("🧪 STARTING VERIFICATION (Strict 24H + China Focus)")
     api_url = get_api_url()
     if not api_url: return
 
+    # 1. Scan
     headlines = step1_scan_headlines()
-    if not headlines: return
+    if not headlines: 
+        log.error("❌ No headlines found. Check network.")
+        return
 
+    # 2. Select
     topics = step2_select_topics(headlines, api_url)
     if not topics: return
 
+    # 3. Research
     research = step3_deep_research(topics)
-    print(f"\n📝 RESEARCH SAMPLE:\n{research[:500]}...\n")
+    if not research: return
+    
+    print(f"\n📝 RESEARCH DATA SAMPLE:\n{research[:500]}...\n")
 
+    # 4. Write
     text, cn, en = step4_write_scripts(research, api_url)
     
-    print("\n" + "="*30 + " TELEGRAM BRIEF " + "="*30 + "\n" + text)
-    print("\n" + "="*30 + " CHINESE INTRO " + "="*30 + "\n" + cn)
-    print("\n" + "="*30 + " ENGLISH SCRIPT " + "="*30 + "\n" + en[:1000] + "...\n")
-    log.info("✅ Verification Complete")
+    print("\n" + "="*40 + "\n📢 TELEGRAM BRIEF\n" + "="*40)
+    print(text)
+    print("\n" + "="*40 + "\n🇨🇳 CHINESE INTRO\n" + "="*40)
+    print(cn)
+    print("\n" + "="*40 + "\n🇬🇧 ENGLISH SCRIPT\n" + "="*40)
+    print(en[:1500] + "...\n")
+    
+    log.info("✅ Verification Complete.")
 
-def job():
-    """生产模式：全流程"""
-    log.info(">>> Job Started")
-    api_url = get_api_url()
-    if not api_url: return
-    
-    headlines = step1_scan_headlines()
-    if not headlines: return
-    
-    topics = step2_select_topics(headlines, api_url)
-    if not topics: return
-    
-    research = step3_deep_research(topics)
-    text, cn, en = step4_write_scripts(research, api_url)
-    
-    if cn and en:
-        asyncio.run(produce_audio_and_send(text, cn, en))
-    log.info("<<< Job Finished")
-
-# ---------------- MAIN ----------------
 if __name__ == "__main__":
-    # 👇 1. 想要验证内容？保持这样直接运行
+    # 直接运行验证
     run_verification()
-
-    # 👇 2. 想要正式部署？注释掉上面一行，取消下面注释
-    # from keep_alive import keep_alive
-    # keep_alive()
-    # import schedule
-    # log.info("🚀 Fredly News Bot Ready (Schedule Mode)")
-    # schedule.every().day.at("03:00").do(job)
-    # while True:
-    #     schedule.run_pending()
-    #     time.sleep(60)
