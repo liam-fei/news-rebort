@@ -1,6 +1,7 @@
 # =============================================
-# Fredly News Bot - PRODUCTION EDITION
-# 特性：全球视角 + 强制中国热点 + 严格24H时效 + 自动发送Telegram
+# Fredly News Bot - Rate Limit Safe Edition
+# 修复：Step 4 连续调用导致的 429 错误
+# 策略：在生成不同稿件之间强制休眠 15 秒
 # =============================================
 
 import os
@@ -33,7 +34,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S"
 )
-log = logging.getLogger("Fredly_Prod")
+log = logging.getLogger("Fredly_Safe")
 
 # ---------------- CONFIG ----------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -41,7 +42,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 if not all([GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, CHAT_ID]):
-    log.error("❌ Error: Missing Environment Variables (GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, CHAT_ID)")
+    log.error("❌ Missing Env Vars")
     sys.exit(1)
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -55,7 +56,6 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 BIN_DIR.mkdir(exist_ok=True)
 
 # ---------------- RSS SOURCES ----------------
-# 组合拳：英国版Google(全球视野) + 中国专属搜索 + 半岛(南方视角)
 RSS_POOLS = {
     "GLOBAL": "https://news.google.com/rss?hl=en-GB&gl=GB&ceid=GB:en",
     "CHINA": "https://news.google.com/rss/search?q=China+when:1d&hl=en-GB&gl=GB&ceid=GB:en",
@@ -65,7 +65,6 @@ RSS_POOLS = {
 # ---------------- HTTP SESSION ----------------
 def make_session():
     s = requests.Session()
-    # 移除 429 自动重试，改用手动长等待
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504], allowed_methods=["GET", "POST"])
     s.mount("https://", HTTPAdapter(max_retries=retries))
     return s
@@ -74,16 +73,13 @@ SESSION = make_session()
 
 # ---------------- UTILS ----------------
 def is_recent(entry, hours=24):
-    """物理过滤：严格丢弃 24 小时前的旧闻"""
     if hasattr(entry, 'published_parsed') and entry.published_parsed:
         try:
             pub_time = datetime.fromtimestamp(mktime(entry.published_parsed))
-            # 放宽到 26 小时以防时区计算误差
             if datetime.now() - pub_time < timedelta(hours=26):
                 return True
             return False 
         except: pass
-    # 如果没有时间戳且是 Google 源，通常是置顶新闻，暂时放行
     return True 
 
 def ensure_ffmpeg():
@@ -114,8 +110,8 @@ def get_api_url():
         models = r.json().get("models", [])
         cands = [m["name"] for m in models if "generateContent" in m.get("supportedGenerationMethods", [])]
         
-        # 优先使用 Flash (速度快且配额较多)，Pro 用于兜底
-        priority = ["gemini-1.5-flash", "gemini-2.5", "gemini-2.0-flash", "gemini-1.5-pro"]
+        # 降级策略：优先用 1.5 Flash (最快/最稳)，Pro 容易 429
+        priority = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5", "gemini-1.5-pro"]
         chosen = next((m for p in priority for m in cands if p in m), cands[0] if cands else None)
         
         if chosen:
@@ -129,35 +125,34 @@ def call_gemini(prompt, base_url, json_mode=False):
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2} # 低温，严谨事实
+        "generationConfig": {"temperature": 0.2}
     }
     if json_mode: payload["generationConfig"]["responseMimeType"] = "application/json"
     
-    # 手动重试循环，处理 429 限流
+    # 重试逻辑
     for attempt in range(3):
         try:
             r = SESSION.post(url, headers=headers, json=payload, timeout=100)
             if r.status_code == 200:
                 return r.json()['candidates'][0]['content']['parts'][0]['text']
             elif r.status_code == 429:
-                wait = (attempt + 1) * 20 # 遇到限流等待 20s, 40s...
-                log.warning(f"⚠️ Rate Limited (429). Sleeping {wait}s...")
+                wait = (attempt + 1) * 20 # 20s, 40s, 60s
+                log.warning(f"⚠️ 429 Limit. Cooling {wait}s...")
                 time.sleep(wait)
                 continue
             else:
-                log.error(f"Gemini API Error {r.status_code}: {r.text}")
+                log.error(f"API Error {r.status_code}: {r.text}")
                 return None
         except Exception as e:
-            log.error(f"Network Error: {e}")
+            log.error(f"Net Error: {e}")
             time.sleep(5)
     return None
 
 # ---------------- PIPELINE ----------------
 
 def step1_scan_headlines():
-    log.info("📡 [Step 1] Scanning Global & China Feeds...")
+    log.info("📡 [Step 1] Scanning Feeds...")
     combined = []
-    
     for cat, url in RSS_POOLS.items():
         try:
             d = feedparser.parse(url)
@@ -165,20 +160,17 @@ def step1_scan_headlines():
             for e in d.entries:
                 if is_recent(e, hours=24):
                     title = e.get("title", "").split(" - ")[0]
-                    # 标记来源，方便 Step 2 识别中国新闻
                     prefix = "[CHINA]" if cat == "CHINA" else "[GLOBAL]"
                     combined.append(f"{prefix} {title}")
                     count += 1
                 if count >= 15: break
-        except Exception as e: log.error(f"Feed error {cat}: {e}")
+        except: pass
     
     random.shuffle(combined)
-    final = combined[:60]
-    log.info(f"   -> Found {len(final)} fresh headlines.")
-    return final
+    return combined[:60]
 
 def step2_select_topics(headlines, api_url):
-    log.info("🧠 [Step 2] AI Selecting Top 5 Events (Strict Mode)...")
+    log.info("🧠 [Step 2] AI Selecting Topics...")
     today = datetime.now().strftime('%Y-%m-%d')
     prompt = (
         f"Role: Chief Editor. Date: {today}\n"
@@ -186,7 +178,7 @@ def step2_select_topics(headlines, api_url):
         "RULES:\n"
         "1. ✅ MUST include at least 1 event related to CHINA (look for [CHINA] tag).\n"
         "2. ✅ Select ONLY specific, concrete events from the LAST 24 HOURS.\n"
-        "3. ❌ REJECT broad topics (e.g. 'Technology', 'Economy') or old news.\n"
+        "3. ❌ REJECT broad topics or old news.\n"
         "Output: JSON array of search queries.\n"
         "Headlines:\n" + "\n".join(headlines)
     )
@@ -197,11 +189,10 @@ def step2_select_topics(headlines, api_url):
     except: return []
 
 def fetch_details(topic):
-    # 强制搜索 24h 内 + 英国版(全球视角)
     query = f"{topic} when:1d"
     url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=en-GB&gl=GB&ceid=GB:en"
     try:
-        time.sleep(1) # 礼貌延迟，防封
+        time.sleep(1) 
         d = feedparser.parse(url)
         if not d.entries: return ""
         
@@ -220,7 +211,6 @@ def fetch_details(topic):
 def step3_deep_research(topics):
     log.info(f"🕵️ [Step 3] Researching {len(topics)} events...")
     results = []
-    # 限制并发为3，避免触发 429
     with ThreadPoolExecutor(max_workers=3) as ex:
         futures = [ex.submit(fetch_details, t) for t in topics]
         for f in as_completed(futures):
@@ -228,12 +218,12 @@ def step3_deep_research(topics):
             if res: results.append(res)
     
     if not results:
-        log.error("❌ No valid recent news found (Circuit Breaker Triggered).")
+        log.error("❌ No valid recent news found.")
         return None
     return "\n".join(results)
 
 def step4_write_scripts(data, api_url):
-    log.info("✍️ [Step 4] Writing Scripts...")
+    log.info("✍️ [Step 4] Writing Scripts (With Cool-down)...")
     today = datetime.now().strftime("%Y-%m-%d")
 
     # 1. Telegram Brief
@@ -245,16 +235,24 @@ def step4_write_scripts(data, api_url):
         f"Data:\n{data}"
     )
     text = call_gemini(p_brief, api_url)
+    
+    # 🔥 核心修改：强制等待 15 秒，防止连续调用触发 429
+    log.info("⏳ Cooling down 15s...")
+    time.sleep(15)
 
     # 2. Chinese Intro
     p_cn = (
         f"Role: Anchor. Date: {today}. Style: CCTV News.\n"
         f"Task: Spoken Intro. Cover top stories + China story.\n"
         f"Rule: No 'First/Second'. Be concise. NO hallucinations.\n"
-        f"Start: '这里是专属GD的早间新闻。今天是{today}。'\n"
+        f"Start: '这里是专属于GD的早间新闻。今天是{today}。'\n"
         f"Data:\n{data}"
     )
     cn = call_gemini(p_cn, api_url)
+
+    # 🔥 再次冷却 15 秒
+    log.info("⏳ Cooling down 15s...")
+    time.sleep(15)
 
     # 3. English Deep Dive
     p_en = (
@@ -278,7 +276,6 @@ async def send_to_user(text, cn, en):
     await edge_tts.Communicate(cn, VOICE_CN).save(f_cn)
     await edge_tts.Communicate(en, VOICE_EN).save(f_en)
     
-    # 混音: 拼接 + 音量1.3倍
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(f_cn), "-i", str(f_en), 
          "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a];[a]volume=1.3[out]", 
@@ -292,12 +289,10 @@ async def send_to_user(text, cn, en):
     
     async with app:
         await app.initialize()
-        # 发送文字简报
         if text:
             safe = text.replace("#", "")
             try: await app.bot.send_message(CHAT_ID, safe, parse_mode="Markdown")
             except: await app.bot.send_message(CHAT_ID, safe)
-        # 发送音频
         if f_final.exists():
             d = datetime.now().strftime("%Y-%m-%d")
             with open(f_final, "rb") as f:
@@ -333,16 +328,14 @@ def job():
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
     from keep_alive import keep_alive
-    keep_alive() # 启动 Web Server 防休眠
+    keep_alive() 
     
-    log.info("🚀 Fredly Bot (Production) Ready")
+    log.info("🚀 Fredly Bot (Safe Rate Limit) Ready")
     
-    # 定时任务: 每天 UTC 03:00 (迪拜 07:00)
     schedule.every().day.at("03:00").do(job)
 
-    # 如需立即测试，在 Render 环境变量设置 RUN_NOW=true
     if os.getenv("RUN_NOW", "false").lower() == "true":
-        log.info("⚡ Manual Trigger Detected")
+        log.info("⚡ Manual Trigger")
         job()
 
     while True:
