@@ -1,7 +1,7 @@
 # =============================================
-# Fredly News Bot - STRICT STABLE LOCK
-# 修复：彻底移除 2.0/2.5 实验版模型，防止触发高频限流
-# 锁定：只允许使用 Gemini 1.5 Flash (最稳) 和 1.5 Pro
+# Fredly News Bot - HIGH IMPACT + SPORTS
+# 策略：宏观内参 (政治/经济) + 中国热点 + 体育 (NBA优先)
+# 配比：1 中国 + 1 体育 + 3 宏观大势
 # =============================================
 
 import os
@@ -22,8 +22,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import feedparser
-import edge_tts  # 👈 这次真的加上了！绝对不会再报 NameError
 import schedule
+import edge_tts 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from telegram.ext import Application
@@ -35,7 +35,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S"
 )
-log = logging.getLogger("Fredly_Locked")
+log = logging.getLogger("Fredly_Sports")
 
 # ---------------- CONFIG ----------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -58,15 +58,19 @@ BIN_DIR.mkdir(exist_ok=True)
 
 # ---------------- RSS SOURCES ----------------
 RSS_POOLS = {
-    "GLOBAL": "https://news.google.com/rss?hl=en-GB&gl=GB&ceid=GB:en",
+    # 1. 商业与经济
+    "BUSINESS": "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWvfSkdnUVZNREZVTm5WNU5FbENkM1JmY2dFUEAV?hl=en-GB&gl=GB&ceid=GB:en",
+    # 2. 全球政治
+    "POLITICS": "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWvfSkdnUVZNREZVTm5WNU5FbENkM1JmY2dFUEAV?hl=en-GB&gl=GB&ceid=GB:en",
+    # 3. 中国专题 (强制搜索)
     "CHINA": "https://news.google.com/rss/search?q=China+when:1d&hl=en-GB&gl=GB&ceid=GB:en",
-    "AL_JAZEERA": "https://www.aljazeera.com/xml/rss/all.xml"
+    # 4. 体育 (新增：混合搜索 NBA 和 热门体育)
+    "SPORTS": "https://news.google.com/rss/search?q=NBA+OR+Soccer+OR+Sports+when:1d&hl=en-GB&gl=GB&ceid=GB:en"
 }
 
 # ---------------- HTTP SESSION ----------------
 def make_session():
     s = requests.Session()
-    # 基础网络连接重试
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504], allowed_methods=["GET", "POST"])
     s.mount("https://", HTTPAdapter(max_retries=retries))
     return s
@@ -102,7 +106,7 @@ def ensure_ffmpeg():
         return True
     except: return False
 
-# ---------------- GEMINI ENGINE (LOCKED) ----------------
+# ---------------- GEMINI ENGINE ----------------
 def get_api_url():
     url = f"{BASE_URL}/models?key={GEMINI_API_KEY}"
     try:
@@ -111,16 +115,11 @@ def get_api_url():
         models = r.json().get("models", [])
         cands = [m["name"] for m in models if "generateContent" in m.get("supportedGenerationMethods", [])]
         
-        # 🔥 核心修复：只保留 1.5 系列，删除了所有 2.0/2.5 实验版
-        # 即使 1.5 暂时不可用，也不许它去用 2.0，因为 2.0 必崩
-        priority = ["gemini-1.5-flash", "gemini-1.5-pro"]
+        # 稳健优先
+        priority = ["gemini-1.5-flash", "gemini-2.5-flash", "gemini-1.5-pro"]
         
         chosen = next((m for p in priority for m in cands if p in m), None)
-        
-        # 如果找不到优先模型，默认回退到列表第一个，但打个警告日志
-        if not chosen and cands: 
-            chosen = cands[0]
-            log.warning(f"⚠️ Preferred models missing. Fallback to: {chosen}")
+        if not chosen and cands: chosen = cands[0]
         
         if chosen:
             log.info(f"✅ AI Engine: {chosen}")
@@ -137,14 +136,13 @@ def call_gemini(prompt, base_url, json_mode=False):
     }
     if json_mode: payload["generationConfig"]["responseMimeType"] = "application/json"
     
-    # 重试逻辑
     for attempt in range(3):
         try:
             r = SESSION.post(url, headers=headers, json=payload, timeout=100)
             if r.status_code == 200:
                 return r.json()['candidates'][0]['content']['parts'][0]['text']
             elif r.status_code == 429:
-                wait = (attempt + 1) * 20 # 20s, 40s, 60s
+                wait = (attempt + 1) * 20
                 log.warning(f"⚠️ 429 Rate Limit. Cooling {wait}s...")
                 time.sleep(wait)
                 continue
@@ -159,7 +157,7 @@ def call_gemini(prompt, base_url, json_mode=False):
 # ---------------- PIPELINE ----------------
 
 def step1_scan_headlines():
-    log.info("📡 [Step 1] Scanning Feeds...")
+    log.info("📡 [Step 1] Scanning Feeds (Biz, Pol, China, Sports)...")
     combined = []
     for cat, url in RSS_POOLS.items():
         try:
@@ -168,25 +166,27 @@ def step1_scan_headlines():
             for e in d.entries:
                 if is_recent(e, hours=24):
                     title = e.get("title", "").split(" - ")[0]
-                    prefix = "[CHINA]" if cat == "CHINA" else "[GLOBAL]"
+                    # 加前缀方便 AI 识别
+                    prefix = f"[{cat}]"
                     combined.append(f"{prefix} {title}")
                     count += 1
-                if count >= 12: break 
+                if count >= 15: break 
         except: pass
-    
     random.shuffle(combined)
-    return combined[:40] # 限制数量，防止 Token 溢出
+    return combined[:60]
 
 def step2_select_topics(headlines, api_url):
-    log.info("🧠 [Step 2] AI Selecting Topics...")
+    log.info("🧠 [Step 2] AI Selecting Topics (High Impact + Sports)...")
     today = datetime.now().strftime('%Y-%m-%d')
+    # 🔥 核心修改：配比指令
     prompt = (
         f"Role: Chief Editor. Date: {today}\n"
-        "Task: Select Top 5 BREAKING NEWS EVENTS.\n"
-        "RULES:\n"
-        "1. ✅ MUST include at least 1 event related to CHINA (look for [CHINA] tag).\n"
-        "2. ✅ Select ONLY specific, concrete events from the LAST 24 HOURS.\n"
-        "3. ❌ REJECT broad topics or old news.\n"
+        "Task: Select Top 5 HEADLINES.\n"
+        "SELECTION CRITERIA (The 'Golden Mix'):\n"
+        "1. ✅ MUST include 1 event related to CHINA ([CHINA] tag).\n"
+        "2. ✅ MUST include 1 MAJOR SPORTS event (Prioritize NBA or major finals, look for [SPORTS]).\n"
+        "3. ✅ The other 3 must be HIGH IMPACT Geopolitics/Economy events.\n"
+        "4. ❌ IGNORE: Small local accidents, celebrity gossip (unless huge).\n"
         "Output: JSON array of search queries.\n"
         "Headlines:\n" + "\n".join(headlines)
     )
@@ -219,7 +219,6 @@ def fetch_details(topic):
 def step3_deep_research(topics):
     log.info(f"🕵️ [Step 3] Researching {len(topics)} events...")
     results = []
-    # 使用 3 线程并发，1.5 Flash 能够承受
     with ThreadPoolExecutor(max_workers=3) as ex:
         futures = [ex.submit(fetch_details, t) for t in topics]
         for f in as_completed(futures):
@@ -239,35 +238,34 @@ def step4_write_scripts(data, api_url):
     p_brief = (
         f"Role: Editor. Date: {today}.\n"
         f"Task: Write Telegram Markdown summary.\n"
-        f"Rule: STRICTLY based on Data. MUST cover the China story.\n"
-        f"Format:\n📅 **早安简报 {today}**\n\n🔥 **今日五大热点**\n1. **[Headline]** - [Detail]\n...\n"
+        f"Rule: Cover Politics, Economy, China, and the Sports story.\n"
+        f"Format:\n📅 **早安简报 {today}**\n\n🔥 **今日重点**\n1. **[Headline]** - [Impact]\n...\n"
         f"Data:\n{data}"
     )
     text = call_gemini(p_brief, api_url)
     
-    # 冷却 15 秒
     log.info("⏳ Cooling down 15s...")
     time.sleep(15)
 
     # 2. Chinese Intro
     p_cn = (
-        f"Role: Anchor. Date: {today}. Style: CCTV News.\n"
-        f"Task: Spoken Intro. Cover top stories + China story.\n"
-        f"Rule: No 'First/Second'. Be concise. NO hallucinations.\n"
+        f"Role: Anchor. Date: {today}. Style: Professional/CCTV.\n"
+        f"Task: Spoken Intro.\n"
+        f"Content: Start with serious macro news/China news. End with the Sports news as a lighter closer.\n"
         f"Start: '这里是专属于GD的早间新闻。今天是{today}。'\n"
         f"Data:\n{data}"
     )
     cn = call_gemini(p_cn, api_url)
 
-    # 冷却 15 秒
     log.info("⏳ Cooling down 15s...")
     time.sleep(15)
 
     # 3. English Deep Dive
     p_en = (
         f"Role: Senior Correspondent. Task: {TARGET_MINUTES}-minute report.\n"
-        f"Style: BBC/Al Jazeera. International perspective.\n"
-        f"Rules: CITE SOURCES. NO INTRO (Start with story). Cover China story in depth.\n"
+        f"Style: Bloomberg/ESPN mix.\n"
+        f"Structure: Deep dive into Geopolitics/Economy first. Dedicate the final segment to the Sports/NBA highlight.\n"
+        f"Rules: CITE SOURCES. NO INTRO.\n"
         f"Data:\n{data}"
     )
     en = call_gemini(p_en, api_url)
@@ -313,9 +311,7 @@ async def send_to_user(text, cn, en):
 
 def job():
     log.info(">>> Job Started")
-    # 启动前缓冲
     time.sleep(5)
-    
     try:
         api = get_api_url()
         if not api: return
@@ -330,15 +326,6 @@ def job():
         if not data: return
         
         txt, c, e = step4_write_scripts(data, api)
-        
-        # 🔥 新增：在日志里打印出来，方便你人工核查内容
-        print("\n" + "="*30 + " [DEBUG] TELEGRAM TEXT " + "="*30)
-        print(txt)
-        print("\n" + "="*30 + " [DEBUG] CHINESE SCRIPT " + "="*30)
-        print(c)
-        print("\n" + "="*30 + " [DEBUG] ENGLISH SCRIPT " + "="*30)
-        print(e[:500] + "...\n") # 英文太长，只打印前500字看看开头
-
         if c and e:
             asyncio.run(send_to_user(txt, c, e))
             
@@ -351,7 +338,7 @@ if __name__ == "__main__":
     from keep_alive import keep_alive
     keep_alive()
     
-    log.info("🚀 Fredly Bot (Strict Lock 1.5) Ready")
+    log.info("🚀 Fredly Bot (High Impact + Sports) Ready")
     
     schedule.every().day.at("03:00").do(job)
 
