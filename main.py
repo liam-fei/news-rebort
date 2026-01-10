@@ -311,7 +311,9 @@ async def send_to_user(text, cn, en):
 
 def job():
     log.info(">>> Job Started")
+    # 启动前缓冲
     time.sleep(5)
+    
     try:
         api = get_api_url()
         if not api: return
@@ -326,6 +328,15 @@ def job():
         if not data: return
         
         txt, c, e = step4_write_scripts(data, api)
+        
+        # 🔥 新增：在日志里打印出来，方便你人工核查内容
+        print("\n" + "="*30 + " [DEBUG] TELEGRAM TEXT " + "="*30)
+        print(txt)
+        print("\n" + "="*30 + " [DEBUG] CHINESE SCRIPT " + "="*30)
+        print(c)
+        print("\n" + "="*30 + " [DEBUG] ENGLISH SCRIPT " + "="*30)
+        print(e[:800] + "...\n") # 英文太长，只打印前500字看看开头
+
         if c and e:
             asyncio.run(send_to_user(txt, c, e))
             
