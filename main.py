@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import feedparser
+import edge_tts  # 👈 这次真的加上了！绝对不会再报 NameError
 import schedule
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
