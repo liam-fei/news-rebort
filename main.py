@@ -1,7 +1,7 @@
 # =============================================
-# Fredly News Bot - Rate Limit Safe Edition
-# 修复：Step 4 连续调用导致的 429 错误
-# 策略：在生成不同稿件之间强制休眠 15 秒
+# Fredly News Bot - STRICT STABLE LOCK
+# 修复：彻底移除 2.0/2.5 实验版模型，防止触发高频限流
+# 锁定：只允许使用 Gemini 1.5 Flash (最稳) 和 1.5 Pro
 # =============================================
 
 import os
@@ -34,7 +34,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S"
 )
-log = logging.getLogger("Fredly_Safe")
+log = logging.getLogger("Fredly_Locked")
 
 # ---------------- CONFIG ----------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -65,6 +65,7 @@ RSS_POOLS = {
 # ---------------- HTTP SESSION ----------------
 def make_session():
     s = requests.Session()
+    # 基础网络连接重试
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504], allowed_methods=["GET", "POST"])
     s.mount("https://", HTTPAdapter(max_retries=retries))
     return s
@@ -76,8 +77,7 @@ def is_recent(entry, hours=24):
     if hasattr(entry, 'published_parsed') and entry.published_parsed:
         try:
             pub_time = datetime.fromtimestamp(mktime(entry.published_parsed))
-            if datetime.now() - pub_time < timedelta(hours=26):
-                return True
+            if datetime.now() - pub_time < timedelta(hours=26): return True
             return False 
         except: pass
     return True 
@@ -101,7 +101,7 @@ def ensure_ffmpeg():
         return True
     except: return False
 
-# ---------------- GEMINI ENGINE ----------------
+# ---------------- GEMINI ENGINE (LOCKED) ----------------
 def get_api_url():
     url = f"{BASE_URL}/models?key={GEMINI_API_KEY}"
     try:
@@ -110,9 +110,16 @@ def get_api_url():
         models = r.json().get("models", [])
         cands = [m["name"] for m in models if "generateContent" in m.get("supportedGenerationMethods", [])]
         
-        # 降级策略：优先用 1.5 Flash (最快/最稳)，Pro 容易 429
-        priority = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5", "gemini-1.5-pro"]
-        chosen = next((m for p in priority for m in cands if p in m), cands[0] if cands else None)
+        # 🔥 核心修复：只保留 1.5 系列，删除了所有 2.0/2.5 实验版
+        # 即使 1.5 暂时不可用，也不许它去用 2.0，因为 2.0 必崩
+        priority = ["gemini-1.5-flash", "gemini-1.5-pro"]
+        
+        chosen = next((m for p in priority for m in cands if p in m), None)
+        
+        # 如果找不到优先模型，默认回退到列表第一个，但打个警告日志
+        if not chosen and cands: 
+            chosen = cands[0]
+            log.warning(f"⚠️ Preferred models missing. Fallback to: {chosen}")
         
         if chosen:
             log.info(f"✅ AI Engine: {chosen}")
@@ -137,7 +144,7 @@ def call_gemini(prompt, base_url, json_mode=False):
                 return r.json()['candidates'][0]['content']['parts'][0]['text']
             elif r.status_code == 429:
                 wait = (attempt + 1) * 20 # 20s, 40s, 60s
-                log.warning(f"⚠️ 429 Limit. Cooling {wait}s...")
+                log.warning(f"⚠️ 429 Rate Limit. Cooling {wait}s...")
                 time.sleep(wait)
                 continue
             else:
@@ -163,11 +170,11 @@ def step1_scan_headlines():
                     prefix = "[CHINA]" if cat == "CHINA" else "[GLOBAL]"
                     combined.append(f"{prefix} {title}")
                     count += 1
-                if count >= 15: break
+                if count >= 12: break 
         except: pass
     
     random.shuffle(combined)
-    return combined[:60]
+    return combined[:40] # 限制数量，防止 Token 溢出
 
 def step2_select_topics(headlines, api_url):
     log.info("🧠 [Step 2] AI Selecting Topics...")
@@ -192,7 +199,7 @@ def fetch_details(topic):
     query = f"{topic} when:1d"
     url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=en-GB&gl=GB&ceid=GB:en"
     try:
-        time.sleep(1) 
+        time.sleep(1)
         d = feedparser.parse(url)
         if not d.entries: return ""
         
@@ -211,6 +218,7 @@ def fetch_details(topic):
 def step3_deep_research(topics):
     log.info(f"🕵️ [Step 3] Researching {len(topics)} events...")
     results = []
+    # 使用 3 线程并发，1.5 Flash 能够承受
     with ThreadPoolExecutor(max_workers=3) as ex:
         futures = [ex.submit(fetch_details, t) for t in topics]
         for f in as_completed(futures):
@@ -223,7 +231,7 @@ def step3_deep_research(topics):
     return "\n".join(results)
 
 def step4_write_scripts(data, api_url):
-    log.info("✍️ [Step 4] Writing Scripts (With Cool-down)...")
+    log.info("✍️ [Step 4] Writing Scripts...")
     today = datetime.now().strftime("%Y-%m-%d")
 
     # 1. Telegram Brief
@@ -236,7 +244,7 @@ def step4_write_scripts(data, api_url):
     )
     text = call_gemini(p_brief, api_url)
     
-    # 🔥 核心修改：强制等待 15 秒，防止连续调用触发 429
+    # 冷却 15 秒
     log.info("⏳ Cooling down 15s...")
     time.sleep(15)
 
@@ -250,7 +258,7 @@ def step4_write_scripts(data, api_url):
     )
     cn = call_gemini(p_cn, api_url)
 
-    # 🔥 再次冷却 15 秒
+    # 冷却 15 秒
     log.info("⏳ Cooling down 15s...")
     time.sleep(15)
 
@@ -304,6 +312,9 @@ async def send_to_user(text, cn, en):
 
 def job():
     log.info(">>> Job Started")
+    # 启动前缓冲
+    time.sleep(5)
+    
     try:
         api = get_api_url()
         if not api: return
@@ -328,9 +339,9 @@ def job():
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
     from keep_alive import keep_alive
-    keep_alive() 
+    keep_alive()
     
-    log.info("🚀 Fredly Bot (Safe Rate Limit) Ready")
+    log.info("🚀 Fredly Bot (Strict Lock 1.5) Ready")
     
     schedule.every().day.at("03:00").do(job)
 
