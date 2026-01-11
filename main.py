@@ -1,7 +1,7 @@
 # =============================================
-# Fredly News Bot - HIGH IMPACT + SPORTS
-# 策略：宏观内参 (政治/经济) + 中国热点 + 体育 (NBA优先)
-# 配比：1 中国 + 1 体育 + 3 宏观大势
+# Fredly News Bot - GOLDEN BALANCE EDITION
+# 修复：解决“太无聊”的问题
+# 策略：从“机械读稿”升级为“资深主播叙事” (Engaging but Factual)
 # =============================================
 
 import os
@@ -35,7 +35,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S"
 )
-log = logging.getLogger("Fredly_Sports")
+log = logging.getLogger("Fredly_Golden")
 
 # ---------------- CONFIG ----------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -58,13 +58,9 @@ BIN_DIR.mkdir(exist_ok=True)
 
 # ---------------- RSS SOURCES ----------------
 RSS_POOLS = {
-    # 1. 商业与经济
     "BUSINESS": "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWvfSkdnUVZNREZVTm5WNU5FbENkM1JmY2dFUEAV?hl=en-GB&gl=GB&ceid=GB:en",
-    # 2. 全球政治
     "POLITICS": "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWvfSkdnUVZNREZVTm5WNU5FbENkM1JmY2dFUEAV?hl=en-GB&gl=GB&ceid=GB:en",
-    # 3. 中国专题 (强制搜索)
     "CHINA": "https://news.google.com/rss/search?q=China+when:1d&hl=en-GB&gl=GB&ceid=GB:en",
-    # 4. 体育 (新增：混合搜索 NBA 和 热门体育)
     "SPORTS": "https://news.google.com/rss/search?q=NBA+OR+Soccer+OR+Sports+when:1d&hl=en-GB&gl=GB&ceid=GB:en"
 }
 
@@ -114,13 +110,9 @@ def get_api_url():
         if r.status_code != 200: return None
         models = r.json().get("models", [])
         cands = [m["name"] for m in models if "generateContent" in m.get("supportedGenerationMethods", [])]
-        
-        # 稳健优先
         priority = ["gemini-1.5-flash", "gemini-2.5-flash", "gemini-1.5-pro"]
-        
         chosen = next((m for p in priority for m in cands if p in m), None)
         if not chosen and cands: chosen = cands[0]
-        
         if chosen:
             log.info(f"✅ AI Engine: {chosen}")
             return f"{BASE_URL}/{chosen}:generateContent"
@@ -132,7 +124,8 @@ def call_gemini(prompt, base_url, json_mode=False):
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2}
+        # 🔥 温度回调到 0.3：保持事实，但语言更流畅、自然，不那么生硬
+        "generationConfig": {"temperature": 0.3} 
     }
     if json_mode: payload["generationConfig"]["responseMimeType"] = "application/json"
     
@@ -157,7 +150,7 @@ def call_gemini(prompt, base_url, json_mode=False):
 # ---------------- PIPELINE ----------------
 
 def step1_scan_headlines():
-    log.info("📡 [Step 1] Scanning Feeds (Biz, Pol, China, Sports)...")
+    log.info("📡 [Step 1] Scanning Feeds...")
     combined = []
     for cat, url in RSS_POOLS.items():
         try:
@@ -166,7 +159,6 @@ def step1_scan_headlines():
             for e in d.entries:
                 if is_recent(e, hours=24):
                     title = e.get("title", "").split(" - ")[0]
-                    # 加前缀方便 AI 识别
                     prefix = f"[{cat}]"
                     combined.append(f"{prefix} {title}")
                     count += 1
@@ -176,187 +168,10 @@ def step1_scan_headlines():
     return combined[:60]
 
 def step2_select_topics(headlines, api_url):
-    log.info("🧠 [Step 2] AI Selecting Topics (High Impact + Sports)...")
+    log.info("🧠 [Step 2] AI Selecting Topics...")
     today = datetime.now().strftime('%Y-%m-%d')
-    # 🔥 核心修改：配比指令
     prompt = (
         f"Role: Chief Editor. Date: {today}\n"
         "Task: Select Top 5 HEADLINES.\n"
-        "SELECTION CRITERIA (The 'Golden Mix'):\n"
-        "1. ✅ MUST include 1 event related to CHINA ([CHINA] tag).\n"
-        "2. ✅ MUST include 1 MAJOR SPORTS event (Prioritize NBA or major finals, look for [SPORTS]).\n"
-        "3. ✅ The other 3 must be HIGH IMPACT Geopolitics/Economy events.\n"
-        "4. ❌ IGNORE: Small local accidents, celebrity gossip (unless huge).\n"
-        "Output: JSON array of search queries.\n"
-        "Headlines:\n" + "\n".join(headlines)
-    )
-    raw = call_gemini(prompt, api_url, json_mode=True)
-    if not raw: return []
-    try:
-        return json.loads(raw.replace("```json", "").replace("```", "").strip())
-    except: return []
-
-def fetch_details(topic):
-    query = f"{topic} when:1d"
-    url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=en-GB&gl=GB&ceid=GB:en"
-    try:
-        time.sleep(1)
-        d = feedparser.parse(url)
-        if not d.entries: return ""
-        
-        block = f"### EVENT: {topic}\n"
-        valid = 0
-        for e in d.entries:
-            if is_recent(e, hours=24):
-                summary = re.sub("<[^<]+?>", "", e.get("summary", ""))[:350]
-                src = e.get("source", {}).get("title", "Unknown")
-                block += f"- {src}: {summary}\n"
-                valid += 1
-                if valid >= 3: break
-        return block if valid > 0 else ""
-    except: return ""
-
-def step3_deep_research(topics):
-    log.info(f"🕵️ [Step 3] Researching {len(topics)} events...")
-    results = []
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        futures = [ex.submit(fetch_details, t) for t in topics]
-        for f in as_completed(futures):
-            res = f.result()
-            if res: results.append(res)
-    
-    if not results:
-        log.error("❌ No valid recent news found.")
-        return None
-    return "\n".join(results)
-
-def step4_write_scripts(data, api_url):
-    log.info("✍️ [Step 4] Writing Scripts...")
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    # 1. Telegram Brief
-    p_brief = (
-        f"Role: Editor. Date: {today}.\n"
-        f"Task: Write Telegram Markdown summary.\n"
-        f"Rule: Cover Politics, Economy, China, and the Sports story.\n"
-        f"Format:\n📅 **早安简报 {today}**\n\n🔥 **今日重点**\n1. **[Headline]** - [Impact]\n...\n"
-        f"Data:\n{data}"
-    )
-    text = call_gemini(p_brief, api_url)
-    
-    log.info("⏳ Cooling down 15s...")
-    time.sleep(15)
-
-    # 2. Chinese Intro
-    p_cn = (
-        f"Role: Anchor. Date: {today}. Style: Professional/CCTV.\n"
-        f"Task: Spoken Intro.\n"
-        f"Content: Start with serious macro news/China news. End with the Sports news as a lighter closer.\n"
-        f"Start: '这里是专属于GD的早间新闻。今天是{today}。'\n"
-        f"Data:\n{data}"
-    )
-    cn = call_gemini(p_cn, api_url)
-
-    log.info("⏳ Cooling down 15s...")
-    time.sleep(15)
-
-    # 3. English Deep Dive
-    p_en = (
-        f"Role: Senior Correspondent. Task: {TARGET_MINUTES}-minute report.\n"
-        f"Style: Bloomberg/ESPN mix.\n"
-        f"Structure: Deep dive into Geopolitics/Economy first. Dedicate the final segment to the Sports/NBA highlight.\n"
-        f"Rules: CITE SOURCES. NO INTRO.\n"
-        f"Data:\n{data}"
-    )
-    en = call_gemini(p_en, api_url)
-    return text, cn, en
-
-# ---------------- PRODUCTION ----------------
-async def send_to_user(text, cn, en):
-    if not ensure_ffmpeg(): return
-    log.info("🎙️ Processing Audio...")
-    
-    f_cn = OUTPUT_DIR / "cn.mp3"
-    f_en = OUTPUT_DIR / "en.mp3"
-    f_final = OUTPUT_DIR / "final.mp3"
-    
-    await edge_tts.Communicate(cn, VOICE_CN).save(f_cn)
-    await edge_tts.Communicate(en, VOICE_EN).save(f_en)
-    
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(f_cn), "-i", str(f_en), 
-         "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a];[a]volume=1.3[out]", 
-         "-map", "[out]", str(f_final)],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    
-    log.info("📤 Sending to Telegram...")
-    t_req = HTTPXRequest(read_timeout=300, write_timeout=300)
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).request(t_req).build()
-    
-    async with app:
-        await app.initialize()
-        if text:
-            safe = text.replace("#", "")
-            try: await app.bot.send_message(CHAT_ID, safe, parse_mode="Markdown")
-            except: await app.bot.send_message(CHAT_ID, safe)
-        if f_final.exists():
-            d = datetime.now().strftime("%Y-%m-%d")
-            with open(f_final, "rb") as f:
-                await app.bot.send_audio(CHAT_ID, f, title=f"News {d}", caption=f"🎧 Briefing {d}")
-            f_final.unlink()
-    
-    f_cn.unlink(); f_en.unlink()
-    log.info("✅ Job Complete!")
-
-def job():
-    log.info(">>> Job Started")
-    # 启动前缓冲
-    time.sleep(5)
-    
-    try:
-        api = get_api_url()
-        if not api: return
-        
-        headlines = step1_scan_headlines()
-        if not headlines: return
-        
-        topics = step2_select_topics(headlines, api)
-        if not topics: return
-        
-        data = step3_deep_research(topics)
-        if not data: return
-        
-        txt, c, e = step4_write_scripts(data, api)
-        
-        # 🔥 新增：在日志里打印出来，方便你人工核查内容
-        print("\n" + "="*30 + " [DEBUG] TELEGRAM TEXT " + "="*30)
-        print(txt)
-        print("\n" + "="*30 + " [DEBUG] CHINESE SCRIPT " + "="*30)
-        print(c)
-        print("\n" + "="*30 + " [DEBUG] ENGLISH SCRIPT " + "="*30)
-        print(e[:800] + "...\n") # 英文太长，只打印前500字看看开头
-
-        if c and e:
-            asyncio.run(send_to_user(txt, c, e))
-            
-    except Exception as e:
-        log.error(f"Critical Job Error: {e}")
-    log.info("<<< Job Finished")
-
-# ---------------- MAIN ----------------
-if __name__ == "__main__":
-    from keep_alive import keep_alive
-    keep_alive()
-    
-    log.info("🚀 Fredly Bot (High Impact + Sports) Ready")
-    
-    schedule.every().day.at("03:00").do(job)
-
-    if os.getenv("RUN_NOW", "false").lower() == "true":
-        log.info("⚡ Manual Trigger")
-        job()
-
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+        "SELECTION CRITERIA:\n"
+        "1. ✅ MUST include
