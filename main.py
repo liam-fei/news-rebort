@@ -172,13 +172,12 @@ def step2_select_topics(headlines, api_url):
     
     # 🔥 修复重点：使用三引号 (""") 包裹 Prompt，防止 SyntaxError
     prompt_base = f"""Role: Chief Editor. Date: {today}
-Task: Select Top 5 HEADLINES.
-SELECTION CRITERIA:
-1. ✅ MUST include 1 event related to CHINA ([CHINA] tag).
-2. ✅ MUST include 1 MAJOR SPORTS event (NBA/Soccer).
-3. ✅ The other 3 must be HIGH IMPACT Geopolitics/Economy events.
-4. ❌ IGNORE: Small local accidents, celebrity gossip.
-Output: JSON array of search queries.
+Task: Select Top 8 HEADLINES for a rapid-fire ticker.
+CRITERIA:
+1. 🌍 DIVERSITY: Mix Global Politics, Business, and 1-2 Sports/China items.
+2. ⚡ IMPACT: Choose events that move markets or change borders.
+3. 🚫 NO FLUFF: No opinion pieces, no small accidents.
+Output: JSON array of 8 search strings.
 Headlines:
 """
     # 拼接标题列表
@@ -267,7 +266,7 @@ INSTRUCTIONS:
 1. Don't just read headlines. Weave the stories together into a coherent narrative.
 2. Focus on the 'WHY' and 'HOW' based on the provided facts.
 3. CITE SOURCES naturally (e.g., 'As reported by Reuters...').
-4. Start directly with the most significant story.
+4. START: 'This is the morning news for GD。Today is {today}。'
 Data:
 {data}"""
 
